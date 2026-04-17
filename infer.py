@@ -8,6 +8,9 @@ from diffusers import (
     UNet2DConditionModel,
     DDPMScheduler
 )
+
+# !chmod 755 infer.py 
+
 from transformers import CLIPTextModel
 
 parser = argparse.ArgumentParser(description="Inference")
@@ -45,12 +48,26 @@ args = parser.parse_args()
 if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
     generator = None 
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+    print(f"Using device: {device}")
 
     # create & load model
+    # pipe = StableDiffusionInpaintPipeline.from_pretrained(
+    #     "stabilityai/stable-diffusion-2-inpainting",
+    #     torch_dtype=torch.float32,
+    #     revision=None
+    # )
+    local_path = "/Users/clai404/.cache/huggingface/hub/models--sd2-community--stable-diffusion-2-inpainting/snapshots/5f74973cbb64c8568780732c17f43eb269d63a0d"
+
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-2-inpainting",
+        local_path,
         torch_dtype=torch.float32,
-        revision=None
+        local_files_only=True
     )
 
     pipe.unet = UNet2DConditionModel.from_pretrained(
@@ -60,11 +77,11 @@ if __name__ == "__main__":
         args.model_path, subfolder="text_encoder", revision=None,
     )
     pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
-    pipe = pipe.to("cuda")
+    pipe = pipe.to(device)
 
     if args.seed is not None:
-        generator = torch.Generator(device="cuda").manual_seed(args.seed)
-    
+        generator = torch.Generator(device=device).manual_seed(args.seed)
+
     image = Image.open(args.validation_image)
     mask_image = Image.open(args.validation_mask)
 
@@ -84,4 +101,8 @@ if __name__ == "__main__":
         result.save(f"{args.output_dir}/{idx}.png")
 
     del pipe
-    torch.cuda.empty_cache()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "mps":
+        # MPS clears automatically, but you can empty the process cache if needed
+        pass
