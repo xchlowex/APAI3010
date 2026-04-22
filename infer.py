@@ -62,12 +62,12 @@ if __name__ == "__main__":
     #     torch_dtype=torch.float32,
     #     revision=None
     # )
-    local_path = "/Users/clai404/.cache/huggingface/hub/models--sd2-community--stable-diffusion-2-inpainting/snapshots/5f74973cbb64c8568780732c17f43eb269d63a0d"
+    local_path = "sd2-community/stable-diffusion-2-inpainting"
 
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
         local_path,
         torch_dtype=torch.float32,
-        local_files_only=True
+        local_files_only=False
     )
 
     pipe.unet = UNet2DConditionModel.from_pretrained(
