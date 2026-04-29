@@ -1,58 +1,44 @@
-# import torch
-# import dreamsim
-# # For versions >= 1.0.0
-# from torchmetrics.image import PeakSignalToNoiseRatio
-# from torchmetrics.image import StructuralSimilarityIndexMeasure
-# # LPIPS is usually kept in its own image submodule
-# from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-# # from torch.hub import dino_vits16
+import torch
+from dreamsim import dreamsim
 
-# import open_clip
-# from PIL import Image
-# import numpy as np
+# Direct imports for TorchMetrics 1.9.0
+from torchmetrics.image import PeakSignalNoiseRatio as PSNR
+from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity as LPIPS
+# from torch.hub import dino_vits16
 
-# # Direct imports for TorchMetrics 1.9.0
-# from torchmetrics.image import PeakSignalToNoiseRatio
-# from torchmetrics.image import StructuralSimilarityIndexMeasure
-# from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+import open_clip
+from PIL import Image
+import numpy as np
 
-# from torchvision import transforms
+from torchvision import transforms
 
-try:
-    # Modern torchmetrics (1.0.0+)
-    from torchmetrics.image import PeakSignalToNoiseRatio as PSNR
-    from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
-    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity as LPIPS
-except ImportError:
-    try:
-        # Older versions or specific sub-paths
-        from torchmetrics.regression import PeakSignalToNoiseRatio as PSNR
-        from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
-        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity as LPIPS
-    except ImportError:
-        # Fallback for even older versions
-        from torchmetrics import PeakSignalToNoiseRatio as PSNR
-        from torchmetrics import StructuralSimilarityIndexMeasure as SSIM
-        from torchmetrics import LearnedPerceptualImagePatchSimilarity as LPIPS
         
 class RealFillBench:
 
     def __init__(self, device="cuda"):
         self.device = device
+        
         # 1. Pixel Metrics
-        self.psnr = PeakSignalToNoiseRatio().to(device)
-        self.ssim = StructuralSimilarityIndexMeasure().to(device)
-        
+        self.psnr = PSNR().to(device)
+        self.ssim = SSIM().to(device)
         # 2. Perceptual Metric (The paper uses VGG-based LPIPS)
-        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(device)
+        self.lpips = LPIPS(net_type='vgg').to(device)
+
+        # Standard Transform for Pixel Metrics (PSNR/SSIM)
+        self.pixel_transform = transforms.Compose([
+            transforms.Resize((512, 512)),
+            transforms.ToTensor(), # Scales to [0, 1] automatically
+        ])
+
+        # 3. dreamsim
+        self.dreamsim_model, self.dreamsim_preprocess = dreamsim(pretrained=True, device=self.device)
+        self.dreamsim_model.eval() # Set to evaluation mode
         
-        # 3. Semantic Metrics (CLIP and DINO)
+        # 4. Semantic Metrics (CLIP and DINO)
         self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
             'ViT-B-32', pretrained='laion2b_s34b_b79k'
         )
-
-        self.dreamsim_model, self.dreamsim_preprocess = dreamsim(
-            pretrained=True, device=self.device)
 
         # dino initialization
         self.clip_model.to(device)
@@ -67,13 +53,17 @@ class RealFillBench:
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
         
-    def calculate_pixel_metrics(self, pred, target):
-        """pred/target: Tensors [1, 3, H, W] normalized [0, 1]"""
+
+    def calculate_pixel_metrics(self, gen_path, target_path):
+        img_gen = self.pixel_transform(Image.open(gen_path).convert('RGB')).unsqueeze(0).to(self.device)
+        img_tgt = self.pixel_transform(Image.open(target_path).convert('RGB')).unsqueeze(0).to(self.device)
+        
         return {
-            "PSNR": self.psnr(pred, target).item(),
-            "SSIM": self.ssim(pred, target).item(),
-            "LPIPS": self.lpips(pred, target).item()
+            "psnr": self.psnr(img_gen, img_tgt).item(),
+            "ssim": self.ssim(img_gen, img_tgt).item(),
+            "lpips": self.lpips(img_gen, img_tgt).item()
         }
+        
 
     def calculate_clip_score(self, gen_img_path, ref_img_path):
         """Measures Identity Preservation (Similarity between result and reference)"""
@@ -90,8 +80,26 @@ class RealFillBench:
 
     
     def calculate_dreamsim_score(self, img_path1, img_path2):
-        img1 = self.dreamsim_preprocess(Image.open(img_path1).convert('RGB')).to(self.device)
-        img2 = self.dreamsim_preprocess(Image.open(img_path2).convert('RGB')).to(self.device)
+        # 1. Load images
+        img1_pil = Image.open(img_path1).convert('RGB')
+        img2_pil = Image.open(img_path2).convert('RGB')
+        
+        # 2. Preprocess
+        img1 = self.dreamsim_preprocess(img1_pil).to(self.device)
+        img2 = self.dreamsim_preprocess(img2_pil).to(self.device)
+        
+        # 3. DEBUG/FIX: Ensure they are exactly 4D [B, C, H, W]
+        if img1.ndim == 3:
+            img1 = img1.unsqueeze(0)
+        elif img1.ndim == 5:
+            img1 = img1.squeeze(0) # Remove accidental extra dimension
+    
+        if img2.ndim == 3:
+            img2 = img2.unsqueeze(0)
+        elif img2.ndim == 5:
+            img2 = img2.squeeze(0)
+    
+        # 4. Run model
         with torch.no_grad():
             distance = self.dreamsim_model(img1, img2)
         return distance.item()
@@ -130,22 +138,18 @@ class RealFillBench:
             return None
 
 
-    def calculate_all(self, gen_path, target_path):
-        # Existing metrics...
-        results = {}
-        # ... (PSNR, SSIM, LPIPS, CLIP)
+    def calculate_all(self, gen_path, target_path, ref_path=None):
+        """Unified entry point for benchmarking"""
+        # 1. Pixel and Perceptual (Gen vs GT)
+        results = self.calculate_pixel_metrics(gen_path, target_path)
         
-        # New DINO Metric
-        results['dino'] = self.calculate_dino(gen_path, target_path)
+        # 2. DreamSim (Gen vs GT)
+        results['dreamsim'] = self.calculate_dreamsim_score(gen_path, target_path)
         
+        # 3. Identity (Gen vs Reference) - If ref_path is provided
+        if ref_path:
+            results['clip_id'] = self.calculate_clip_score(gen_path, ref_path)
+            results['dino_id'] = self.calculate_dino(gen_path, ref_path)
+    
         return results
-
-    # def evaluation(gen_path, target_path):
-    #     # Calculate
-    #     results = evaluator.calculate_all(gen_path, target_path)
-        
-    #     print(f"--- Results for {sample_name} ---")
-    #     for metric, value in results.items():
-    #         print(f"{metric}: {value}")
-        
-    #     return results
+    
