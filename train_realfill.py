@@ -24,6 +24,11 @@ from torch.utils.data import Dataset
 import torchvision.transforms.v2 as transforms_v2
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, CLIPTextModel
+import torch.nn.functional as F
+from torchvision.transforms.functional import gaussian_blur
+from torchvision import transforms
+import torch.nn as nn
+from diffusers.image_processor import VaeImageProcessor
 
 import diffusers
 from diffusers import (
@@ -37,11 +42,45 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from peft import PeftModel, LoraConfig, get_peft_model
+from models import DINOv2GeometricAdapter
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.20.1")
 
 logger = get_logger(__name__)
+
+def frequency_weighted_loss(pred_noise, target_noise, alpha_hf=2.0):
+    
+    """
+    Calculates MSE loss with a higher weight on high-frequency components.
+    Works on 4D Latent Tensors [B, 4, 64, 64].
+    """
+
+    # dtype = pred_noise.dtype
+    pred_noise = pred_noise.float()
+    target_noise = target_noise.float()
+    
+    # 1. Use a 3x3 kernel for Latent Space (64x64)
+    # Ensure kernel is odd and sigma is appropriate
+    kernel_size = [3, 3]
+    sigma = [0.5, 0.5] 
+
+    # 2. Extract Low Frequency (Blurred version)
+    # torchvision.transforms.functional.gaussian_blur handles [B, C, H, W]
+    low_freq_target = gaussian_blur(target_noise, kernel_size=kernel_size, sigma=sigma)
+    low_freq_pred = gaussian_blur(pred_noise, kernel_size=kernel_size, sigma=sigma)
+    
+    # 3. Extract High Frequency (Residual)
+    high_freq_target = target_noise - low_freq_target
+    high_freq_pred = pred_noise - low_freq_pred
+    
+    # 4. Calculate weighted loss
+    loss_lf = F.mse_loss(low_freq_pred, low_freq_target)
+    loss_hf = F.mse_loss(high_freq_pred, high_freq_target)
+    
+    return loss_lf + (alpha_hf * loss_hf)
+
+    
 
 def make_mask(images, resolution, times=30):
     mask, times = torch.ones_like(images[0:1, :, :]), np.random.randint(1, times)
@@ -94,70 +133,186 @@ You can find some example images in the following. \n
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
         f.write(yaml + model_card)
 
+
 @torch.no_grad()
 def log_validation(
+    vae,
     text_encoder,
     tokenizer,
     unet,
     args,
     accelerator,
     weight_dtype,
-    epoch,
+    epoch,   # Added epoch so the tracker knows which step this is
+    adapter, # Added adapter so we can use the geometric branch
 ):
-    logger.info(
-        f"Running validation... \nGenerating {args.num_validation_images} images"
-    )
+    logger.info(f"Running validation... Generating {args.num_validation_images} images")
 
-    # create pipeline (note: unet and vae are loaded again in float32)
+
+    # 1. Initialize standard pipeline
     pipeline = StableDiffusionInpaintPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
+        vae=accelerator.unwrap_model(vae, keep_fp32_wrapper=True),
         tokenizer=tokenizer,
         revision=args.revision,
+        torch_dtype=weight_dtype,
     )
+    
+    # 2. Unwrap and Inject GeoFill Components
 
-    # set `keep_fp32_wrapper` to True because we do not want to remove
-    # mixed precision hooks while we are still training
     pipeline.unet = accelerator.unwrap_model(unet, keep_fp32_wrapper=True)
     pipeline.text_encoder = accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True)
-    pipeline.scheduler = DDPMScheduler.from_config(pipeline.scheduler.config)
+    pipeline.to(accelerator.device)
 
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
+    pipeline.vae.to(accelerator.device, dtype=weight_dtype)
+    pipeline.unet.to(accelerator.device, dtype=weight_dtype)
+    pipeline.text_encoder.to(accelerator.device, dtype=weight_dtype)
+    
+    orig_vae_encode = pipeline.vae.encode
+    orig_vae_decode = pipeline.vae.decode
 
-    # run inference
-    generator = None if args.seed is None else torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
+    def vae_encode_dtype_safe(x, *args, **kwargs):
+        vae_param = next(pipeline.vae.parameters())
+        x = x.to(device=vae_param.device, dtype=vae_param.dtype)
+        return orig_vae_encode(x, *args, **kwargs)
+    
+    def vae_decode_dtype_safe(z, *args, **kwargs):
+        vae_param = next(pipeline.vae.parameters())
+        # print("VAE decode input before:", z.dtype, z.device)
+        z = z.to(device=vae_param.device, dtype=vae_param.dtype)
+        # print("VAE decode input after:", z.dtype, z.device)
+
+        return orig_vae_decode(z, *args, **kwargs)
+
+
+    pipeline.vae.encode = vae_encode_dtype_safe
+    pipeline.vae.decode = vae_decode_dtype_safe
+
+
+    # Ensure Adapter in eval mode on correct device
+    unwrapped_adapter = accelerator.unwrap_model(adapter).eval()
+
+    # 3. Load target data for inpainting
     target_dir = Path(args.train_data_dir) / "target"
-    target_image, target_mask = target_dir / "target.png", target_dir / "mask.png"
-    image, mask_image = Image.open(target_image), Image.open(target_mask)
+    image = Image.open(target_dir / "target.png").convert("RGB")
+    mask = Image.open(target_dir / "mask.png").convert("L")
 
-    if image.mode != "RGB":
-        image = image.convert("RGB")
 
+    # This matches the 'ref_transforms' in your RealFillDataset class
+
+    ref_transform = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+    # Load the first image from your reference folder
+    ref_dir = Path(args.train_data_dir) / "ref"
+    ref_image_path = sorted(list(ref_dir.glob("*.png")) + list(ref_dir.glob("*.jpg")))[0]
+    ref_pil = Image.open(ref_image_path).convert("RGB")
+    ref_tensor = ref_transform(ref_pil).unsqueeze(0).to(accelerator.device)
+    
+
+    # Initialize processor
+    mask_processor = VaeImageProcessor(vae_scale_factor=8, do_normalize=False, do_binarize=True, do_convert_grayscale=True)
+    image_processor = VaeImageProcessor(vae_scale_factor=8)
+
+    # Process images into tensors on the correct device and dtype
+    # init_image = image_processor.preprocess(image).to(accelerator.device, dtype=weight_dtype)
+    # mask = mask_processor.preprocess(mask_image).to(accelerator.device, dtype=weight_dtype)
+    
+    init_image = image.resize((args.resolution, args.resolution))
+    mask = mask.resize((args.resolution, args.resolution))
+
+
+    # 4. PREPARE THE 333-TOKEN CONTEXT
+    # Project via Adapter (This runs the internal DINO + Projection layers)
+    projected_geometry = unwrapped_adapter(ref_tensor).to(
+        device=accelerator.device,
+        dtype=weight_dtype
+    ) # [1, 256, 1024]
+
+    # C. Get Text Embeddings
+    prompt = "a photo of sks"
+    text_inputs = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+    prompt_embeds = pipeline.text_encoder(text_inputs.input_ids.to(accelerator.device))[0] # [1, 77, 1024]
+
+    # D. Concatenate into 333 tokens
+    fused_embeds = torch.cat([prompt_embeds, projected_geometry], dim=1).to(device=accelerator.device, dtype=weight_dtype)
+
+# 1. Create matching Negative Prompt Embeds (333 tokens)
+    # A. Get the standard 77-token null embedding
+    uncond_tokens = tokenizer([""], padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt").input_ids.to(accelerator.device)
+    uncond_embeds = pipeline.text_encoder(uncond_tokens)[0].to(dtype=weight_dtype) # [1, 77, 1024]
+
+    # B. Create zero-padding for the geometric part (256 tokens)
+    # This ensures the negative prompt has no "geometric" influence
+    neg_padding = torch.zeros((1, 256, 1024), device=accelerator.device, dtype=weight_dtype)
+
+    # C. Concatenate to reach 333
+    negative_fused_embeds = torch.cat([uncond_embeds, neg_padding], dim=1) # [1, 333, 1024]
+
+    # 5. Run Inference
     images = []
-    for _ in range(args.num_validation_images):
-        image = pipeline(
-            prompt="a photo of sks", image=image, mask_image=mask_image,
-            num_inference_steps=200, guidance_scale=1, generator=generator
-        ).images[0]
-        images.append(image)
+    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
 
+# Debugging
+    # print("==== VALIDATION DEBUG ====")
+    # print("vae dtype:", next(pipeline.vae.parameters()).dtype)
+    # print("unet dtype:", next(pipeline.unet.parameters()).dtype)
+    # print("text encoder dtype:", next(pipeline.text_encoder.parameters()).dtype)
+    # print("fused_embeds dtype:", fused_embeds.dtype)
+    # print("negative_fused_embeds dtype:", negative_fused_embeds.dtype)
+    # print("image type:", type(init_image))
+    # print("mask type:", type(mask))
+    # print("fused shape:", fused_embeds.shape)
+    # print("negative shape:", negative_fused_embeds.shape)
+    # print("==========================")
+
+    for _ in range(args.num_validation_images):
+        output = pipeline(
+            prompt_embeds=fused_embeds, 
+            negative_prompt_embeds=negative_fused_embeds, # Add this line!
+            image=init_image,
+            mask_image=mask,
+            num_inference_steps=50, 
+            guidance_scale=7.5,
+            generator=generator
+        ).images[0]
+        images.append(output)
+
+    # # 5. Run Inference with fused_embeds
+    # images = []
+    # generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
+
+    # for _ in range(args.num_validation_images):
+    #     # We use prompt_embeds instead of prompt string to bypass internal CLIP encoding
+    #     output = pipeline(
+    #         prompt_embeds=fused_embeds, 
+    #         image=image, 
+    #         mask_image=mask_image,
+    #         num_inference_steps=50, # Reduced for speed in validation
+    #         guidance_scale=args.guidance_scale if hasattr(args, 'guidance_scale') else 7.5,
+    #         generator=generator
+    #     ).images[0]
+    #     images.append(output)
+
+    # 6. Logging to Trackers
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(f"validation", np_images, epoch, dataformats="NHWC")
+            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
         if tracker.name == "wandb":
-            tracker.log(
-                {
-                    f"validation": [
-                        wandb.Image(image, caption=str(i)) for i, image in enumerate(images)
-                    ]
-                }
-            )
+            tracker.log({"validation": [wandb.Image(img) for img in images]})
+
+    # Restore the original VAE encode/decode methods so training VAE is not left wrapped.
+    pipeline.vae.encode = orig_vae_encode
+    pipeline.vae.decode = orig_vae_decode
 
     del pipeline
     torch.cuda.empty_cache()
-
     return images
 
 def parse_args(input_args=None):
@@ -405,6 +560,12 @@ def parse_args(input_args=None):
         default="none",
         help="The bias type of the Lora update matrices. Must be 'none', 'all' or 'lora_only'.",
     )
+    parser.add_argument(
+        "--freq_loss_alpha",
+        type=float,
+        default=2.0,
+        help="Alpha weight for high-frequency loss component in frequency-weighted loss.",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -439,7 +600,16 @@ class RealFillDataset(Dataset):
         if not (self.ref_data_root.exists() and self.target_image.exists() and self.target_mask.exists()):
             raise ValueError("Train images root doesn't exist.")
 
-        self.train_images_path = list(self.ref_data_root.iterdir()) + [self.target_image]
+        self.train_images_dir = os.path.join(train_data_root, "ref")
+        valid_extensions = (".jpg", ".jpeg", ".png", ".JPEG", ".JPG", ".PNG")
+        self.train_images_path = [
+            os.path.join(self.train_images_dir, f) 
+            for f in sorted(os.listdir(self.train_images_dir)) 
+            if f.lower().endswith(valid_extensions)
+        ]
+        self.target_image_path = os.path.join(train_data_root, "target", "target.png") # Adjust filename if needed
+        self.train_images_path.append(self.target_image_path)
+        
         self.num_train_images = len(self.train_images_path)
         self.train_prompt = "a photo of sks"
 
@@ -447,11 +617,22 @@ class RealFillDataset(Dataset):
             [
                 transforms_v2.RandomResize(size, int(1.125 * size)),
                 transforms_v2.RandomCrop(size),
-                transforms_v2.ToImageTensor(),
+                # transforms_v2.ToImageTensor(),
+                transforms_v2.ToImage(),
                 transforms_v2.ConvertImageDtype(),
                 transforms_v2.Normalize([0.5], [0.5]),
             ]
         )
+        # Add a transform specifically for DINOv2 (needs 224x224)
+        self.dinov2_transform = transforms_v2.Compose(
+            [
+                transforms_v2.Resize((224, 224), interpolation=transforms_v2.InterpolationMode.BICUBIC),
+                # transforms_v2.ToImageTensor(),
+                transforms_v2.ToImage(),
+                transforms_v2.ToDtype(torch.float32, scale=True), # Use ToDtype instead of ConvertImageDtype                transforms_v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms_v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ADD THIS
+           ])
+
 
     def __len__(self):
         return self.num_train_images
@@ -492,27 +673,32 @@ class RealFillDataset(Dataset):
             return_tensors="pt",
         ).input_ids
 
+    # 6. FIXED: Select and transform the DINO reference image
+        # This must happen AFTER ref_img is loaded from disk
+        num_refs = len(self.train_images_path) - 1
+        ref_idx = random.randint(0, num_refs - 1)
+        ref_img_pil = Image.open(self.train_images_path[ref_idx]).convert("RGB")
+        example["ref_pixel_values"] = self.dinov2_transform(ref_img_pil)
+        
         return example
 
 def collate_fn(examples):
     input_ids = [example["prompt_ids"] for example in examples]
     images = [example["images"] for example in examples]
-
     masks = [example["masks"] for example in examples]
     weightings = [example["weightings"] for example in examples]
     conditioning_images = [example["conditioning_images"] for example in examples]
+    
+    # ADDED THIS LINE:
+    ref_pixel_values = [example["ref_pixel_values"] for example in examples]
 
-    images = torch.stack(images)
-    images = images.to(memory_format=torch.contiguous_format).float()
-
-    masks = torch.stack(masks)
-    masks = masks.to(memory_format=torch.contiguous_format).float()
-
-    weightings = torch.stack(weightings)
-    weightings = weightings.to(memory_format=torch.contiguous_format).float()
-
-    conditioning_images = torch.stack(conditioning_images)
-    conditioning_images = conditioning_images.to(memory_format=torch.contiguous_format).float()
+    images = torch.stack(images).to(memory_format=torch.contiguous_format).float()
+    masks = torch.stack(masks).to(memory_format=torch.contiguous_format).float()
+    weightings = torch.stack(weightings).to(memory_format=torch.contiguous_format).float()
+    conditioning_images = torch.stack(conditioning_images).to(memory_format=torch.contiguous_format).float()
+    
+    # ADDED THIS LINE:
+    ref_pixel_values = torch.stack(ref_pixel_values).to(memory_format=torch.contiguous_format).float()
 
     input_ids = torch.cat(input_ids, dim=0)
 
@@ -522,10 +708,12 @@ def collate_fn(examples):
         "masks": masks,
         "weightings": weightings,
         "conditioning_images": conditioning_images,
+        "ref_pixel_values": ref_pixel_values, # ADDED THIS LINE
     }
     return batch
 
 def main(args):
+    
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator = Accelerator(
@@ -535,6 +723,15 @@ def main(args):
         project_dir=logging_dir,
     )
 
+    weight_dtype = torch.float16 if accelerator.mixed_precision == "fp16" else torch.float32
+
+    # Load DINOv2 ONCE here
+    dinov2_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+    dinov2_model.to(accelerator.device) 
+    dinov2_model.eval()
+
+    # KEEP this in float32 as well.
+    # Note: adapter is created after unet is loaded (below) since it needs unet.config.cross_attention_dim
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
@@ -592,6 +789,12 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
 
+    # Create the adapter and pass the model into it
+    # Use unet's cross_attention_dim (typically 1024 for SD 2.1)
+    adapter = DINOv2GeometricAdapter(dinov2_model=dinov2_model, sd_dim=unet.config.cross_attention_dim)
+    adapter.to(accelerator.device, dtype=torch.float32)
+
+
     unet_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
@@ -609,7 +812,7 @@ def main(args):
         bias=args.lora_bias,
     )
     text_encoder = get_peft_model(text_encoder, text_encoder_config)
-
+    
     vae.requires_grad_(False)
 
     if args.enable_xformers_memory_efficient_attention:
@@ -633,25 +836,42 @@ def main(args):
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             for model in models:
-                sub_dir = "unet" if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet).base_model.model)) else "text_encoder"
-                model.save_pretrained(os.path.join(output_dir, sub_dir))
-
-                # make sure to pop weight so that corresponding model is not saved again
-                weights.pop()
+                model_to_save = accelerator.unwrap_model(model)
+                
+                if hasattr(model_to_save, "base_model"):
+                    # Handle LoRA models
+                    is_unet = isinstance(model_to_save.base_model.model, type(accelerator.unwrap_model(unet).base_model.model))
+                    sub_dir = "unet" if is_unet else "text_encoder"
+                    model_to_save.save_pretrained(os.path.join(output_dir, sub_dir))
+                elif hasattr(model_to_save, "proj"):
+                    # Handle your custom DINO adapter
+                    torch.save(model_to_save.state_dict(), os.path.join(output_dir, "adapter.bin"))
+    
+                if weights:
+                    weights.pop()
 
     def load_model_hook(models, input_dir):
         while len(models) > 0:
-            # pop models so that they are not loaded again
             model = models.pop()
+            model_to_load = accelerator.unwrap_model(model)
 
-            sub_dir = "unet" if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet).base_model.model)) else "text_encoder"
-            model_cls = UNet2DConditionModel if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet).base_model.model)) else CLIPTextModel
-
-            load_model = model_cls.from_pretrained(args.pretrained_model_name_or_path, subfolder=sub_dir)
-            load_model = PeftModel.from_pretrained(load_model, input_dir, subfolder=sub_dir)
-
-            model.load_state_dict(load_model.state_dict())
-            del load_model
+            # 1. Handle PEFT models (UNet, Text Encoder)
+            if hasattr(model_to_load, "base_model"):
+                # Check if it's UNet or Text Encoder to get the right subfolder
+                is_unet = isinstance(model_to_load.base_model.model, type(accelerator.unwrap_model(unet).base_model.model))
+                sub_dir = "unet" if is_unet else "text_encoder"
+                
+                # Use PEFT's specific loading logic
+                model.load_adapter(os.path.join(input_dir, sub_dir), "default")
+                
+            # 2. Handle your Custom Adapter (DINOv2GeometricAdapter)
+            elif hasattr(model_to_load, "proj"):
+                adapter_path = os.path.join(input_dir, "adapter.bin")
+                if os.path.exists(adapter_path):
+                    # Map to CPU first to avoid OOM, then move to device
+                    state_dict = torch.load(adapter_path, map_location="cpu")
+                    model_to_load.load_state_dict(state_dict)
+                    logger.info(f"Successfully loaded custom adapter weights from {adapter_path}")
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
@@ -680,21 +900,26 @@ def main(args):
             )
 
         optimizer_class = bnb.optim.AdamW8bit
+        
     else:
         optimizer_class = torch.optim.AdamW
 
-    # Optimizer creation
+    # Move VAE to device with weight_dtype
+    vae.to(accelerator.device, dtype=weight_dtype)
+
+    # Create one unified optimizer
     optimizer = optimizer_class(
         [
             {"params": unet.parameters(), "lr": args.unet_learning_rate},
-            {"params": text_encoder.parameters(), "lr": args.text_encoder_learning_rate}
+            {"params": text_encoder.parameters(), "lr": args.text_encoder_learning_rate},
+            {"params": adapter.proj.parameters(), "lr": args.unet_learning_rate}
         ],
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
 
-    # Dataset and DataLoaders creation:
+    # Create dataset and dataloader
     train_dataset = RealFillDataset(
         train_data_root=args.train_data_dir,
         tokenizer=tokenizer,
@@ -709,13 +934,14 @@ def main(args):
         num_workers=1,
     )
 
-    # Scheduler and math around the number of training steps.
+    # Calculate training steps
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
+    # Create scheduler
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -725,28 +951,10 @@ def main(args):
         power=args.lr_power,
     )
 
-    # Prepare everything with our `accelerator`.
-    unet, text_encoder, optimizer, train_dataloader = accelerator.prepare(
-        unet, text_encoder, optimizer, train_dataloader
+    # Prepare all components with accelerator
+    unet, text_encoder, adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, text_encoder, adapter, optimizer, train_dataloader, lr_scheduler
     )
-
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    # Move vae to device and cast to weight_dtype
-    vae.to(accelerator.device, dtype=weight_dtype)
-
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -806,62 +1014,85 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         text_encoder.train()
+        adapter.train()
 
+        logger.info("***** Running training *****")
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet, text_encoder):
-                # Convert images to latent space
-                latents = vae.encode(batch["images"].to(dtype=weight_dtype)).latent_dist.sample()
-                latents = latents * 0.18215
+            ####################################
+            # 1. Prepare Inputs
+            # Get latents for the target image
+            latents = vae.encode(batch["images"].to(dtype=weight_dtype)).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor
 
-                # Convert masked images to latent space
-                conditionings = vae.encode(batch["conditioning_images"].to(dtype=weight_dtype)).latent_dist.sample()
-                conditionings = conditionings * 0.18215
+            # Get latents for the conditioning (masked) image
+            conditionings = vae.encode(batch["conditioning_images"].to(dtype=weight_dtype)).latent_dist.sample()
+            conditionings = conditionings * vae.config.scaling_factor
 
-                # Downsample mask and weighting so that they match with the latents
-                masks, size = batch["masks"].to(dtype=weight_dtype), latents.shape[2:]
-                masks = F.interpolate(masks, size=size)
+            # Prepare mask (must match latent resolution)
+            masks = batch["masks"].to(dtype=weight_dtype)
+            masks = F.interpolate(masks, size=latents.shape[2:])
 
-                weightings = batch["weightings"].to(dtype=weight_dtype)
-                weightings = F.interpolate(weightings, size=size)
+            # Forward Diffusion
+            noise = torch.randn_like(latents)
+            bsz = latents.shape[0]
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
+            # Concatenate for Inpainting UNet (9 channels total)
+            inputs = torch.cat([noisy_latents, masks, conditionings], dim=1)
 
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
-                )
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Concatenate noisy latents, masks and conditionings to get inputs to unet
-                inputs = torch.cat([noisy_latents, masks, conditionings], dim=1)
-
-                # Get the text embedding for conditioning
+            # 2. Extract Conditioning Features
+            # Important: Include 'adapter' in the accumulate call
+            with accelerator.accumulate(unet, text_encoder, adapter):
+                # Text Embeddings
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                
+                # Geometric Embeddings from DINOv2
 
-                # Predict the noise residual
-                model_pred = unet(inputs, timesteps, encoder_hidden_states).sample
+                # Force unwrap the reference images before passing to the adapter
+                ref_images = batch["ref_pixel_values"]
+                if isinstance(ref_images, (list, tuple)):
+                    ref_images = ref_images[0]
 
-                # Compute the diffusion loss
-                assert noise_scheduler.config.prediction_type == "epsilon"
-                loss = (weightings * F.mse_loss(model_pred.float(), noise.float(), reduction="none")).mean()
+                # print(f"DEBUG: Passing to adapter - Type: {type(ref_images)}, Shape: {ref_images.shape}")
+                # Now pass the clean tensor
+                geom_hidden_states = adapter(ref_images.to(accelerator.device))                
+                # geom_hidden_states = geom_hidden_states.to(dtype=weight_dtype)  # Already in weight_dtype
 
-                # Backpropagate
+                # Combined Cross-Attention Source
+                combined_hidden_states = torch.cat([encoder_hidden_states, geom_hidden_states], dim=1)
+                # print(f"Combined cross-attention shape: {combined_hidden_states.shape}") # Removed () and fixed plural name
+
+                # print("DEBUG 4: Calling UNet")
+                # 3. Predict Noise
+                model_pred = unet(
+                    sample=inputs, 
+                    timestep=timesteps, 
+                    encoder_hidden_states=combined_hidden_states
+                    ).sample
+
+                # print('Successful pass to unet')
+                 
+                # 4. Frequency-Aware Loss
+                # Use the custom function you defined at the top of the script
+                loss = frequency_weighted_loss(model_pred, noise, alpha_hf=args.freq_loss_alpha)
+
+                # Backprop
                 accelerator.backward(loss)
+                
                 if accelerator.sync_gradients:
+                    # ADDED: adapter.parameters() needs clipping too
                     params_to_clip = itertools.chain(
-                        unet.parameters(), text_encoder.parameters()
+                        unet.parameters(), 
+                        text_encoder.parameters(), 
+                        adapter.parameters() 
                     )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+            ####################################
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -901,6 +1132,7 @@ def main(args):
                         text_encoder.eval()
                         
                         log_validation(
+                            vae,
                             text_encoder,
                             tokenizer,
                             unet,
@@ -908,6 +1140,7 @@ def main(args):
                             accelerator,
                             weight_dtype,
                             global_step,
+                            adapter
                         )
 
             logs = {"loss": loss.detach().item()}
@@ -920,17 +1153,37 @@ def main(args):
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        # 1. Properly unwrap and merge the UNet
+        unwrapped_unet = accelerator.unwrap_model(unet)
+        merged_unet = unwrapped_unet.merge_and_unload()
+
+        # 2. Properly unwrap and merge the Text Encoder
+        unwrapped_text_encoder = accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True)
+        merged_text_encoder = unwrapped_text_encoder.merge_and_unload()
+
+        # 3. Load the pipeline with the merged components
         pipeline = StableDiffusionInpaintPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
-            unet=accelerator.unwrap_model(unet, keep_fp32_wrapper=True).merge_and_unload(),
-            text_encoder=accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True).merge_and_unload(),
+            unet=merged_unet,
+            text_encoder=merged_text_encoder,
             revision=args.revision,
+            torch_dtype=weight_dtype # Good practice to ensure dtype consistency
         )
 
         pipeline.save_pretrained(args.output_dir)
 
+        # --- ADD THIS PART ---
+        # Save the custom DINOv2 adapter state
+        adapter_save_path = os.path.join(args.output_dir, "adapter.bin")
+        unwrapped_adapter = accelerator.unwrap_model(adapter)
+        torch.save(unwrapped_adapter.state_dict(), adapter_save_path)
+        # print(f"Custom adapter saved to {adapter_save_path}")
+        # ---------------------
+
+
         # Final inference
         images = log_validation(
+            vae,
             text_encoder,
             tokenizer,
             unet,
@@ -938,6 +1191,7 @@ def main(args):
             accelerator,
             weight_dtype,
             global_step,
+            adapter
         )
 
         if args.push_to_hub:
